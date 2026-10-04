@@ -4,6 +4,11 @@ How the DINOv3-B foundation model (`dino-foundation-e2e_train-903ak8:step_600`) 
 **42.4 ms to 26.9 ms** of TensorRT engine time on the gen1 RTX 4080 without retraining, and
 what was tried and rejected along the way.
 
+> **Status (2026-10-03): on the car.** `aoligei_map` (FP16 encoder + dense map seg) is on
+> `1stage/09_25_2026_test` ([#133922](https://github.com/AppliedNeuron/core-stack/pull/133922))
+> and was test driven: the gen1 stack runs it at **10 Hz**, and driving behavior is decent for a
+> foundation model trained on a ~3 month old recipe. See [On the car](#on-the-car).
+
 - Training run: [research/hybrid_rl/dino-foundation-e2e_train-903ak8](https://appliedintuition.wandb.io/research/hybrid_rl/runs/dino-foundation-e2e_train-903ak8)
 - Export branch: [`export-dino-903ak8`](https://github.com/AppliedNeuron/core-stack/tree/export-dino-903ak8) (core-stack)
 - Pipeline: [mosaic/ml-opt-suite](https://buildkite.com/mosaic/ml-opt-suite), `export_validate_profile`, STRONG (strongly typed) TRT 10.8, CC89
@@ -15,8 +20,8 @@ what was tried and rejected along the way.
 |---|---|---|---|---|---|
 | BF16 baseline ([5014](https://buildkite.com/mosaic/ml-opt-suite/builds/5014)) | 42.4 ms | 44.4 ms | ref | 1.000 | |
 | **aoligei** ([5018](https://buildkite.com/mosaic/ml-opt-suite/builds/5018)) | **26.9 ms** | 27.8 ms | +0.027 ± 0.031 | 0.973 | on `1stage/09_25_2026_test` ([#133889](https://github.com/AppliedNeuron/core-stack/pull/133889)) |
-| **aoligei_map** (aoligei + dense map seg) | ~30 ms (est.: aoligei + ~3 ms seg branch) | ~31 ms (est.) | planner path identical to aoligei | identical to aoligei | exporting ([5027](https://buildkite.com/mosaic/ml-opt-suite/builds/5027) / [5028](https://buildkite.com/mosaic/ml-opt-suite/builds/5028)) |
-| aoligei + INT8 qkv/fc1 | — | 24.4 ms | +0.028 ± 0.027 | 0.974 | flag ready, not shipped (no seg) |
+| **aoligei_map** (aoligei + dense map seg) | ~30 ms (est.: aoligei + ~3 ms seg branch) | ~31 ms (est.) | planner path identical to aoligei | identical to aoligei | **on the car at 10 Hz** ([#133922](https://github.com/AppliedNeuron/core-stack/pull/133922), build [5028](https://buildkite.com/mosaic/ml-opt-suite/builds/5028)) |
+| aoligei + INT8 qkv/fc1 | — | 24.4 ms | +0.028 ± 0.027 | 0.974 | flag ready; next lever on top of aoligei_map |
 | aoligei + INT8 qkv/fc1/fc2 ([5023](https://buildkite.com/mosaic/ml-opt-suite/builds/5023)) | 22.8 ms | 22.3 ms | −0.017 ± 0.025 | 0.956 | not shipped (perception drift) |
 | chip_shot (ResNet-50) | — | 17.1 ms | — | — | reference |
 
@@ -87,6 +92,33 @@ lane-color channel), so the onboard entry uses the tethys preset set:
 `e2e_1stage_with_map_7cam_trajectory_dense` / `..._dense_drivable_no_intention` /
 `runtime_config_steering_angle_map_dense_drivable` / `waypoint_q2_extended_2x_fov`.
 
+## On the car
+
+| model | contents | branch | result |
+|---|---|---|---|
+| `aoligei` | FP16 encoder, batched PETR, no map seg | [#133889](https://github.com/AppliedNeuron/core-stack/pull/133889) | not closed-loop testable: no `map_seg_*` |
+| `aoligei_map` | FP16 encoder, batched PETR, dense map seg (8ch drivable) | [#133922](https://github.com/AppliedNeuron/core-stack/pull/133922) | **10 Hz on the gen1 stack PC; driving behavior decent** |
+
+- Closed-loop testing needs the map seg outputs (safety), so the seg branch is the price of the
+  road: ~3 ms of engine time.
+- The 10 Hz is the whole stack, not just the engine: the TRT engine time is ~30 ms of the 100 ms
+  frame, and the stack runs it under CUDA graphs (`use_cuda_graph: true`), which comes in slightly
+  under the profiler number.
+- The recipe behind 903ak8 is ~3 months old. Behavior that is already decent points at the DINO
+  backbone carrying a lot; a re-run on the current recipe is the natural next comparison.
+- Cloud CI note: a `gpu-g6` export (L4) profiles the same engine at 65.7 ms. The L4 is much slower
+  than the car's 4080, so use the on-prem 4080 queue (`ml_optimization_gpu_4080`) for latency
+  numbers and g6 only as a CC89 build host.
+
+### Next levers
+
+1. **INT8 qkv/fc1** on top of aoligei_map: about −3.4 ms local, same open-loop accuracy and
+   detection recall; build flag ready, needs a fresh calibration JSON for any new checkpoint.
+2. **Lower ViT resolution** (biggest lever, ~−9 ms): needs a short fine-tune; if the next DINO run
+   is a retrain on the current recipe, training at 352x640 from the start removes the extra step.
+3. **End-to-end breakdown**: split the 100 ms frame into preprocessing, engine and postprocessing
+   from a drive log to see where the remaining headroom is.
+
 ## INT8 SmoothQuant for the ViT (built, not shipped)
 
 Commits [`6ecf7ac`](https://github.com/AppliedNeuron/core-stack/commit/6ecf7ac12ea40eef27e05107f463ef3938b6522f),
@@ -117,8 +149,8 @@ rows — exact in float — after which activation max/p99.99 ratios are ≤ ~4.
 | INT8 neck | slower | — | — | reject |
 | FP8 attention (MHA) | −0.6 ms | — | — | reject: TRT forbids INT8 + FP8 in one engine |
 
-INT8 is a pure stack on top of aoligei_map: the qkv/fc1 level is the next candidate once a
-seg-carrying engine is validated on the car.
+INT8 is a pure stack on top of aoligei_map: with aoligei_map now running at 10 Hz on the car,
+the qkv/fc1 level is the next candidate if more headroom is needed.
 
 ## Resolution (needs a fine-tune; not launched)
 
@@ -176,3 +208,7 @@ with INT8 would land near chip_shot (~19 ms local).
 - Retyping an already-retyped ONNX leaves BF16 casts outside the scope; always start from the BF16 ONNX.
 - Day-branch runtimes derive the engine name without the `_linux_x64` token: land the unsuffixed
   `.trt` and always ship the `.onnx`.
+- Land the TRT-preprocessed ONNX (`tensorrt/one_stage_modified.onnx`), not `onnx/model.onnx`: the
+  FP16 retype happens in the TRT transform, and the car rebuilds its engine from the landed ONNX.
+- The suite's S3 engine upload is keyed by checkpoint, so every export of 903ak8 (aoligei,
+  aoligei_map, INT8 variants) writes the same S3 path; take engines from the build artifacts.
