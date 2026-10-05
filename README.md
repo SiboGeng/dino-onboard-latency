@@ -71,6 +71,23 @@ Tried and rejected in this family:
 | ViT blocks FP16, LayerNorm/Softmax kept BF16 | 80.8 | NaN outputs; casts break attention fusion |
 | whole model FP16 | −0.24 ms vs encoder-only | not worth the head-precision risk |
 
+Where the time goes after FP16 (fused-layer attribution, local, FP16-encoder engine with seg):
+backbone 20.2, det head 3.9, map head 3.8 (of which ~3 is the dense seg branch), neck 3.1,
+tokenizer 2.9, planner 2.2, other 2.5 ms. The ViT is still two thirds of the engine.
+
+Parity against the BF16 PyTorch model (suite-style validation, 5 scenarios x 10 frames). These
+measure divergence from BF16, not error: FP16 carries more mantissa than BF16.
+
+| | BF16 STRONG | FP16 image encoder | FP16 ViT blocks only |
+|---|---|---|---|
+| mean FDE@1s | 0.4 cm | 1.4 cm | 1.4 cm |
+| mean FDE@4s | 2.7 cm | 10.4 cm | 10.2 cm |
+| worst scenario FDE@4s | 4.4 cm | 27.8 cm | 27.5 cm |
+| mode-selection flips | 0/50 | 2/50 | 2/50 |
+| map seg label mismatch | 0.12% | 0.71% | 0.71% |
+
+The ViT blocks alone account for all of the drift; the FPN/neck in FP16 adds nothing measurable.
+
 ### 2. Batched PETR position embeddings (−0.5 to −1.7 ms, lossless)
 
 `PVFeatureTokenizer` built the PETR 3D position embedding in a per-camera loop: 7 calls, each a
@@ -186,8 +203,31 @@ with INT8 would land near chip_shot (~19 ms local).
   `predicted_trajectory` against the logged ego future (`target_trajectory`), and reports paired
   per-frame dADE with a 95% CI plus detection recall vs the BF16 engine, split front / other /
   rear sectors.
+- Per-layer profiling inflates wall clock by ~14%, and the 4070 Ti SUPER runs the same engine
+  ~1.24x slower than the 4080 (per-layer sum), so local wall clock / 1.24 ≈ 4080 wall clock.
 - Local loop: RTX 4070 Ti SUPER, TRT 10.8.0.43 + the deformable aggregation plugin from the
-  same source tree, no Bazel build needed per iteration.
+  same source tree, no Bazel build needed per iteration. The loop: rewrite the suite's ONNX
+  (retype / unbracket / Q/DQ insertion), build with the suite's builder settings, time with
+  interleaved A/B, then score with the ground-truth harness (run through `bazel run --run_under`
+  so it gets the suite's venv, runfiles and S3 env). Only winners go through Buildkite.
+- ONNX surgery on the exported graph tests an idea in minutes; anything that survives is then
+  made suite-native (build flag or model code) so CI exports reproduce it.
+
+## Export config for a DINO foundation checkpoint
+
+Arch parity items the 903ak8 export needed on top of master's `latest_sdv2_export.yaml` (all
+checked by the load summary: 0 shape mismatches, 0 missing):
+
+- encoder `dinov3_b_dinofpn`; every consumer of the neck sized for 768 channels (depth head
+  `dim_in`, neck out/intermediate width, det/map `feature_projection` Conv2d 768 → 256, PV
+  tokenizer `input_embed_dims: 768`), with `embed_dims` pinned to 256
+- det decoder `apply_quality_score: true` (the foundation ranks boxes by
+  sigmoid(cls) x sigmoid(centerness))
+- instance tokenizer top-k: det 450, map 256
+- `pv_camera_indices: null` (all 7 cameras feed PV tokens)
+- seg head 8 channels: `drivable_area_seg_enabled: true`, `lane_color_seg_enabled: false`
+- `navigation_crop_radius_meters: 200` (trained at the doubled nav FOV)
+- checkpoint pinned by W&B artifact (`checkpoint_wandb_artifact`), `checkpoint_s3_url: null`
 
 ## Code map (export branch)
 
@@ -210,5 +250,12 @@ with INT8 would land near chip_shot (~19 ms local).
   `.trt` and always ship the `.onnx`.
 - Land the TRT-preprocessed ONNX (`tensorrt/one_stage_modified.onnx`), not `onnx/model.onnx`: the
   FP16 retype happens in the TRT transform, and the car rebuilds its engine from the landed ONNX.
+- `branch_prep.py`'s `camelot_style` bundle writes the plain dense presets
+  (`runtime_config_steering_angle_map_dense`, `waypoint_q2_extended`). A drivable-seg model trained
+  at 200 m needs the tethys set; diff the new entry against `tethys` before landing.
+- The export branch also needs the forkserver DataLoader / metrics-namespace fixes for the suite
+  step (cherry-picked); without them validation dies with `ConnectionRefusedError`.
+- The on-prem 4080 queue has a single host (butter) and can sit idle-queued for 30+ minutes;
+  `gpu-g6` builds a CC89 engine that lands fine, but its latency numbers are not the car's.
 - The suite's S3 engine upload is keyed by checkpoint, so every export of 903ak8 (aoligei,
   aoligei_map, INT8 variants) writes the same S3 path; take engines from the build artifacts.
